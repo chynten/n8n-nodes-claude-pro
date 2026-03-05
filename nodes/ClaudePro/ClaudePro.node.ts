@@ -32,12 +32,32 @@ interface SSEParsedResult {
   usage: { inputTokens: number; outputTokens: number };
 }
 
+function isOAuthToken(token: string): boolean {
+  return token.startsWith('sk-ant-oat');
+}
+
+function buildAuthHeaders(token: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    'anthropic-version': '2023-06-01',
+    'content-type': 'application/json',
+  };
+  if (isOAuthToken(token)) {
+    headers['Authorization'] = `Bearer ${token}`;
+    headers['anthropic-beta'] = 'oauth-2025-04-20,claude-code-20250219';
+    headers['anthropic-dangerous-direct-browser-access'] = 'true';
+  } else {
+    headers['x-api-key'] = token;
+  }
+  return headers;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function formatApiError(error: any): string {
   const statusCode = error.httpCode || error.statusCode || error.code;
 
   if (statusCode === 401) {
-    return 'Setup token is invalid or expired. Run `claude setup-token` again.';
+    return 'Authentication failed. Your Claude Code token (sk-ant-oat01-*) may have expired. '
+      + 'Run `claude setup-token` again to get a fresh token.';
   }
   if (statusCode === 403) {
     return 'Token does not have permission for this model.';
@@ -123,16 +143,12 @@ async function executeStreamingFallback(
   return new Promise((resolve, reject) => {
     const postData = JSON.stringify(body);
 
+    const baseHeaders = buildAuthHeaders(token);
     const options = {
       hostname: 'api.anthropic.com',
       path: '/v1/messages',
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(postData),
-      },
+      headers: { ...baseHeaders, 'content-length': Buffer.byteLength(postData) },
     };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -265,6 +281,10 @@ export class ClaudePro implements INodeType {
     const items = this.getInputData();
     const returnData: INodeExecutionData[] = [];
 
+    const credentials = await this.getCredentials('claudeProApi');
+    const token = credentials.setupToken as string;
+    const authHeaders = buildAuthHeaders(token);
+
     for (let i = 0; i < items.length; i++) {
       try {
         const model = this.getNodeParameter('model', i) as string;
@@ -318,9 +338,7 @@ export class ClaudePro implements INodeType {
               returnFullResponse: true,
               encoding: 'text',
               json: false,
-              headers: {
-                'content-type': 'application/json',
-              },
+              headers: authHeaders,
             });
 
             const rawBody =
@@ -336,6 +354,7 @@ export class ClaudePro implements INodeType {
             method: 'POST',
             url: 'https://api.anthropic.com/v1/messages',
             body,
+            headers: authHeaders,
           })) as AnthropicResponse;
 
           const textBlocks = response.content.filter((b) => b.type === 'text');

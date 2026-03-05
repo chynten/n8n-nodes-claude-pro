@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-claude-pro",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "n8n node for Claude Pro via setup-token authentication. No CLI required on the server.",
   "keywords": [
     "n8n-community-node-package",
@@ -37,12 +37,15 @@
     "n8n-workflow": "*"
   },
   "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^8.57.0",
     "n8n-core": "^1.70.0",
     "n8n-workflow": "^1.70.0",
-    "typescript": "^5.7.0",
-    "@typescript-eslint/parser": "^8.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.0.0",
-    "eslint": "^8.57.0",
-    "prettier": "^3.4.0"
+    "prettier": "^3.4.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.2.69"
   }
 }
