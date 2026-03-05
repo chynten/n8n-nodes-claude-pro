@@ -1,0 +1,10 @@
+{
+  "node": "n8n-nodes-claude-pro.claudePro",
+  "nodeVersion": "1.0",
+  "codexVersion": "1.0",
+  "categories": ["AI"],
+  "subcategories": {
+    "AI": ["Language Models"]
+  },
+  "alias": ["anthropic", "claude", "ai", "llm", "chat"]
+}

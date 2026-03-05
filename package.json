@@ -1,0 +1,48 @@
+{
+  "name": "n8n-nodes-claude-pro",
+  "version": "1.0.0",
+  "description": "n8n node for Claude Pro via setup-token authentication. No CLI required on the server.",
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "claude",
+    "anthropic",
+    "ai",
+    "llm"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "Claude Pro Node Contributors"
+  },
+  "main": "dist/nodes/ClaudePro/ClaudePro.node.js",
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "nodes": [
+      "dist/nodes/ClaudePro/ClaudePro.node.js"
+    ],
+    "credentials": [
+      "dist/credentials/ClaudeProApi.credentials.js"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "eslint . --ext .ts",
+    "lint:fix": "eslint . --ext .ts --fix"
+  },
+  "files": [
+    "dist"
+  ],
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "devDependencies": {
+    "n8n-core": "^1.70.0",
+    "n8n-workflow": "^1.70.0",
+    "typescript": "^5.7.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.4.0"
+  }
+}
