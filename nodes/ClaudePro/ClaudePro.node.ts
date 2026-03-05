@@ -1,6 +1,8 @@
 import {
   IExecuteFunctions,
+  ILoadOptionsFunctions,
   INodeExecutionData,
+  INodePropertyOptions,
   INodeType,
   INodeTypeDescription,
   NodeOperationError,
@@ -205,13 +207,11 @@ export class ClaudePro implements INodeType {
         displayName: 'Model',
         name: 'model',
         type: 'options',
-        options: [
-          { name: 'Claude Opus 4', value: 'claude-opus-4-0-20250514' },
-          { name: 'Claude Sonnet 4', value: 'claude-sonnet-4-20250514' },
-          { name: 'Claude Haiku 3.5', value: 'claude-3-5-haiku-20241022' },
-        ],
-        default: 'claude-sonnet-4-20250514',
-        description: 'The Claude model to use',
+        typeOptions: {
+          loadOptionsMethod: 'getModels',
+        },
+        default: '',
+        description: 'The Claude model to use. List is fetched live from the API.',
       },
       {
         displayName: 'Prompt',
@@ -275,6 +275,28 @@ export class ClaudePro implements INodeType {
         description: 'Max tokens for the thinking process',
       },
     ],
+  };
+
+  methods = {
+    loadOptions: {
+      async getModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+        const credentials = await this.getCredentials('claudeProApi');
+        const token = credentials.setupToken as string;
+        const headers = buildAuthHeaders(token);
+
+        const response = await this.helpers.httpRequest({
+          method: 'GET',
+          url: 'https://api.anthropic.com/v1/models',
+          headers,
+        });
+
+        const models = (response.data || []) as Array<{ id: string; display_name: string }>;
+        return models.map((m) => ({
+          name: m.display_name,
+          value: m.id,
+        }));
+      },
+    },
   };
 
   async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
