@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-claude-pro",
-  "version": "1.2.0",
+  "version": "2.0.5",
   "description": "n8n node for Claude Pro via setup-token authentication. No CLI required on the server.",
   "keywords": [
     "n8n-community-node-package",
@@ -25,7 +25,7 @@
     ]
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp nodes/ClaudePro/claude-pro.svg dist/nodes/ClaudePro/claude-pro.svg",
     "dev": "tsc --watch",
     "lint": "eslint . --ext .ts",
     "lint:fix": "eslint . --ext .ts --fix"

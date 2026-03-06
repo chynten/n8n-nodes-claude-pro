@@ -1,16 +1,36 @@
 import {
-  IExecuteFunctions,
   ILoadOptionsFunctions,
   INodeExecutionData,
   INodePropertyOptions,
   INodeType,
   INodeTypeDescription,
-  NodeOperationError,
+  ISupplyDataFunctions,
+  NodeConnectionType,
+  NodeConnectionTypes,
+  SupplyData,
 } from 'n8n-workflow';
+
+import { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import type { BaseChatModelCallOptions, BindToolsInput } from '@langchain/core/language_models/chat_models';
+import type { BaseMessage } from '@langchain/core/messages';
+import { AIMessageChunk } from '@langchain/core/messages';
+import type { ChatResult } from '@langchain/core/outputs';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { ToolCall } from '@langchain/core/messages/tool';
+import type { BaseLanguageModelInput } from '@langchain/core/language_models/base';
+import { convertToOpenAITool } from '@langchain/core/utils/function_calling';
+import type { Runnable } from '@langchain/core/runnables';
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnthropicTool = { name: string; description: string; input_schema: Record<string, any> };
 
 interface AnthropicContentBlock {
   type: string;
   text?: string;
+  id?: string;
+  name?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  input?: Record<string, any>;
 }
 
 interface AnthropicUsage {
@@ -24,14 +44,6 @@ interface AnthropicResponse {
   content: AnthropicContentBlock[];
   stop_reason: string;
   usage: AnthropicUsage;
-}
-
-interface SSEParsedResult {
-  text: string;
-  thinking: string;
-  model: string;
-  stopReason: string;
-  usage: { inputTokens: number; outputTokens: number };
 }
 
 function isOAuthToken(token: string): boolean {
@@ -54,148 +66,307 @@ function buildAuthHeaders(token: string): Record<string, string> {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function formatApiError(error: any): string {
-  const statusCode = error.httpCode || error.statusCode || error.code;
+function convertMessages(messages: BaseMessage[]): Array<{ role: string; content: any }> {
+  return messages.map((msg) => {
+    const msgType = msg._getType();
 
-  if (statusCode === 401) {
-    return 'Authentication failed. Your Claude Code token (sk-ant-oat01-*) may have expired. '
-      + 'Run `claude setup-token` again to get a fresh token.';
-  }
-  if (statusCode === 403) {
-    return 'Token does not have permission for this model.';
-  }
-  if (statusCode === 429) {
-    return 'Rate limited by Anthropic API. Retry after a delay.';
-  }
-  if (statusCode === 529 || statusCode === 500) {
-    return 'Anthropic API error. Retry later.';
-  }
-  if (statusCode === 400) {
-    const msg = error.message || error.body?.error?.message || 'Bad request';
-    return `Anthropic API error: ${msg}`;
-  }
+    if (msgType === 'tool') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const toolMsg = msg as any;
+      return {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolMsg.tool_call_id || toolMsg.additional_kwargs?.tool_call_id,
+            content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+          },
+        ],
+      };
+    }
 
-  return error.message || 'Unknown error occurred';
+    let role: string;
+    switch (msgType) {
+      case 'human':
+        role = 'user';
+        break;
+      case 'ai':
+        role = 'assistant';
+        break;
+      default:
+        role = 'user';
+    }
+
+    // For AI messages with tool calls, reconstruct Anthropic content blocks
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const aiMsg = msg as any;
+    if (msgType === 'ai' && aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const content: any[] = [];
+      const textContent = typeof msg.content === 'string' ? msg.content : '';
+      if (textContent) {
+        content.push({ type: 'text', text: textContent });
+      }
+      for (const tc of aiMsg.tool_calls) {
+        content.push({
+          type: 'tool_use',
+          id: tc.id,
+          name: tc.name,
+          input: tc.args,
+        });
+      }
+      return { role, content };
+    }
+
+    const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    return { role, content };
+  });
 }
 
-function parseSSE(raw: string, fallbackModel: string): SSEParsedResult {
-  const lines = raw.split('\n');
-  let text = '';
-  let thinking = '';
-  let model = fallbackModel;
-  let stopReason = '';
-  let inputTokens = 0;
-  let outputTokens = 0;
+function extractSystemMessage(messages: BaseMessage[]): { system?: string; filtered: BaseMessage[] } {
+  const systemMsgs = messages.filter((m) => m._getType() === 'system');
+  const filtered = messages.filter((m) => m._getType() !== 'system');
+  const system = systemMsgs.length > 0
+    ? systemMsgs.map((m) => typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).join('\n')
+    : undefined;
+  return { system, filtered };
+}
 
-  for (const line of lines) {
-    if (!line.startsWith('data: ')) continue;
+function openAiToolToAnthropic(tools: BindToolsInput[]): AnthropicTool[] {
+  return tools.map((tool) => {
+    const openAiTool = convertToOpenAITool(tool);
+    return {
+      name: openAiTool.function.name,
+      description: openAiTool.function.description || '',
+      input_schema: openAiTool.function.parameters || { type: 'object', properties: {} },
+    };
+  });
+}
 
-    const data = line.slice(6).trim();
-    if (data === '[DONE]') break;
+interface ClaudeProCallOptions extends BaseChatModelCallOptions {
+  tools?: AnthropicTool[];
+}
 
-    let event;
+interface N8nExecutionContext {
+  addInputData: ISupplyDataFunctions['addInputData'];
+  addOutputData: ISupplyDataFunctions['addOutputData'];
+  connectionType: NodeConnectionType;
+}
+
+interface ClaudeProModelInput {
+  token: string;
+  modelId: string;
+  maxTokens: number;
+  temperature: number;
+  extendedThinking: boolean;
+  thinkingBudget?: number;
+  tools?: AnthropicTool[];
+  n8nContext?: N8nExecutionContext;
+}
+
+class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
+  private token: string;
+  private modelId: string;
+  private maxTokens: number;
+  private temperature: number;
+  private extendedThinking: boolean;
+  private thinkingBudget?: number;
+  private boundTools?: AnthropicTool[];
+  private n8nContext?: N8nExecutionContext;
+
+  lc_serializable = false;
+
+  constructor(fields: ClaudeProModelInput) {
+    super({});
+    this.token = fields.token;
+    this.modelId = fields.modelId;
+    this.maxTokens = fields.maxTokens;
+    this.temperature = fields.temperature;
+    this.extendedThinking = fields.extendedThinking;
+    this.thinkingBudget = fields.thinkingBudget;
+    this.boundTools = fields.tools;
+    this.n8nContext = fields.n8nContext;
+  }
+
+  _llmType(): string {
+    return 'claude-pro';
+  }
+
+  bindTools(
+    tools: BindToolsInput[],
+    _kwargs?: Partial<ClaudeProCallOptions>,
+  ): Runnable<BaseLanguageModelInput, AIMessageChunk, ClaudeProCallOptions> {
+    const anthropicTools = openAiToolToAnthropic(tools);
+    return new ClaudeProChatModel({
+      token: this.token,
+      modelId: this.modelId,
+      maxTokens: this.maxTokens,
+      temperature: this.temperature,
+      extendedThinking: this.extendedThinking,
+      thinkingBudget: this.thinkingBudget,
+      tools: anthropicTools,
+      n8nContext: this.n8nContext,
+    }) as unknown as Runnable<BaseLanguageModelInput, AIMessageChunk, ClaudeProCallOptions>;
+  }
+
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    _runManager?: CallbackManagerForLLMRun,
+  ): Promise<ChatResult> {
+    // Log input to n8n execution tracker
+    let runIndex: number | undefined;
+    if (this.n8nContext) {
+      const inputPayload: INodeExecutionData[] = messages.map((msg) => ({
+        json: { role: msg._getType(), content: msg.content },
+      }));
+      const result = this.n8nContext.addInputData(this.n8nContext.connectionType, [inputPayload]);
+      runIndex = result.index;
+    }
+
     try {
-      event = JSON.parse(data);
-    } catch {
-      continue;
-    }
+      const chatResult = await this._callApi(messages, options);
 
-    switch (event.type) {
-      case 'message_start':
-        if (event.message?.model) model = event.message.model;
-        if (event.message?.usage?.input_tokens) {
-          inputTokens = event.message.usage.input_tokens;
-        }
-        break;
+      // Log output to n8n execution tracker
+      if (this.n8nContext && runIndex !== undefined) {
+        const outputPayload: INodeExecutionData[] = chatResult.generations.map((g) => ({
+          json: {
+            text: g.text,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            toolCalls: (g.message as any).tool_calls || [],
+            tokenUsage: g.message.additional_kwargs?.usage || {},
+          },
+        }));
+        this.n8nContext.addOutputData(this.n8nContext.connectionType, runIndex, [outputPayload]);
+      }
 
-      case 'content_block_delta':
-        if (event.delta?.type === 'text_delta') {
-          text += event.delta.text || '';
-        } else if (event.delta?.type === 'thinking_delta') {
-          thinking += event.delta.thinking || '';
-        }
-        break;
-
-      case 'message_delta':
-        if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
-        if (event.usage?.output_tokens) outputTokens = event.usage.output_tokens;
-        break;
+      return chatResult;
+    } catch (error) {
+      if (this.n8nContext && runIndex !== undefined) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        this.n8nContext.addOutputData(this.n8nContext.connectionType, runIndex, error as any);
+      }
+      throw error;
     }
   }
 
-  return {
-    text,
-    thinking,
-    model,
-    stopReason,
-    usage: { inputTokens, outputTokens },
-  };
-}
+  private async _callApi(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+  ): Promise<ChatResult> {
+    const { system, filtered } = extractSystemMessage(messages);
+    const apiMessages = convertMessages(filtered);
 
-async function executeStreamingFallback(
-  context: IExecuteFunctions,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  body: Record<string, any>,
-): Promise<INodeExecutionData> {
-  const https = require('https');
-
-  const credentials = await context.getCredentials('claudeProApi');
-  const token = credentials.setupToken as string;
-
-  return new Promise((resolve, reject) => {
-    const postData = JSON.stringify(body);
-
-    const baseHeaders = buildAuthHeaders(token);
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: { ...baseHeaders, 'content-length': Buffer.byteLength(postData) },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const body: Record<string, any> = {
+      model: this.modelId,
+      max_tokens: this.maxTokens,
+      messages: apiMessages,
     };
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const req = https.request(options, (res: any) => {
-      let rawData = '';
+    if (system) {
+      body.system = system;
+    }
 
-      res.on('data', (chunk: Buffer) => {
-        rawData += chunk.toString();
+    const tools = (options.tools && options.tools.length > 0) ? options.tools : this.boundTools;
+    if (tools && tools.length > 0) {
+      body.tools = tools;
+    }
+
+    if (this.extendedThinking && this.thinkingBudget) {
+      body.thinking = { type: 'enabled', budget_tokens: this.thinkingBudget };
+      body.temperature = 1;
+    } else {
+      body.temperature = this.temperature;
+    }
+
+    const headers = buildAuthHeaders(this.token);
+    const https = require('https');
+
+    const response = await new Promise<AnthropicResponse>((resolve, reject) => {
+      const postData = JSON.stringify(body);
+      const reqOptions = {
+        hostname: 'api.anthropic.com',
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { ...headers, 'content-length': Buffer.byteLength(postData) },
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const req = https.request(reqOptions, (res: any) => {
+        let rawData = '';
+        res.on('data', (chunk: Buffer) => { rawData += chunk.toString(); });
+        res.on('end', () => {
+          if (res.statusCode && res.statusCode >= 400) {
+            reject(new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(rawData) as AnthropicResponse);
+          } catch {
+            reject(new Error(`Failed to parse Anthropic response: ${rawData}`));
+          }
+        });
       });
-
-      res.on('end', () => {
-        if (res.statusCode && res.statusCode >= 400) {
-          const error = new Error(`HTTP ${res.statusCode}: ${rawData}`);
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (error as any).statusCode = res.statusCode;
-          reject(error);
-          return;
-        }
-
-        const parsed = parseSSE(rawData, body.model);
-        resolve({ json: { ...parsed } });
-      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      req.on('error', (error: any) => reject(error));
+      req.write(postData);
+      req.end();
     });
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    req.on('error', (error: any) => reject(error));
-    req.write(postData);
-    req.end();
-  });
+    const textBlocks = response.content.filter((b) => b.type === 'text');
+    const toolUseBlocks = response.content.filter((b) => b.type === 'tool_use');
+    const text = textBlocks.map((b) => b.text || '').join('');
+
+    const toolCalls: ToolCall[] = toolUseBlocks.map((b) => ({
+      name: b.name || '',
+      args: b.input || {},
+      id: b.id || '',
+      type: 'tool_call' as const,
+    }));
+
+    const aiMessage = new AIMessageChunk({
+      content: text,
+      tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+      additional_kwargs: {
+        usage: {
+          input_tokens: response.usage.input_tokens,
+          output_tokens: response.usage.output_tokens,
+        },
+      },
+    });
+
+    return {
+      generations: [
+        {
+          text,
+          message: aiMessage,
+        },
+      ],
+    };
+  }
 }
 
 export class ClaudePro implements INodeType {
   description: INodeTypeDescription = {
-    displayName: 'Claude Pro',
+    displayName: 'Claude Pro LM',
     name: 'claudePro',
     icon: 'file:claude-pro.svg',
     group: ['transform'],
-    version: 1,
+    version: 2,
     subtitle: '={{$parameter["model"]}}',
-    description: 'Send messages to Claude via setup-token authentication. No CLI required.',
+    description: 'Language Model node for Claude via setup-token authentication.',
     defaults: {
-      name: 'Claude Pro',
+      name: 'Claude Pro LM',
     },
-    inputs: ['main'],
-    outputs: ['main'],
+    codex: {
+      categories: ['AI'],
+      subcategories: {
+        AI: ['Language Models', 'Root Nodes'],
+      },
+    },
+    inputs: [],
+    outputs: [NodeConnectionTypes.AiLanguageModel],
     credentials: [
       {
         name: 'claudeProApi',
@@ -214,23 +385,6 @@ export class ClaudePro implements INodeType {
         description: 'The Claude model to use. List is fetched live from the API.',
       },
       {
-        displayName: 'Prompt',
-        name: 'prompt',
-        type: 'string',
-        typeOptions: { rows: 6 },
-        default: '',
-        required: true,
-        description: 'The message to send to Claude. Supports n8n expressions.',
-      },
-      {
-        displayName: 'System Prompt',
-        name: 'systemPrompt',
-        type: 'string',
-        typeOptions: { rows: 4 },
-        default: '',
-        description: 'Optional system prompt to set context for Claude',
-      },
-      {
         displayName: 'Max Tokens',
         name: 'maxTokens',
         type: 'number',
@@ -245,14 +399,6 @@ export class ClaudePro implements INodeType {
         typeOptions: { minValue: 0, maxValue: 2, numberPrecision: 1 },
         default: 1.0,
         description: 'Controls randomness. Lower values are more deterministic.',
-      },
-      {
-        displayName: 'Streaming',
-        name: 'streaming',
-        type: 'boolean',
-        default: false,
-        description:
-          'Whether to use SSE streaming. Response is still collected fully before output.',
       },
       {
         displayName: 'Extended Thinking',
@@ -299,120 +445,32 @@ export class ClaudePro implements INodeType {
     },
   };
 
-  async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-    const items = this.getInputData();
-    const returnData: INodeExecutionData[] = [];
-
+  async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
     const credentials = await this.getCredentials('claudeProApi');
     const token = credentials.setupToken as string;
-    const authHeaders = buildAuthHeaders(token);
 
-    for (let i = 0; i < items.length; i++) {
-      try {
-        const model = this.getNodeParameter('model', i) as string;
-        const prompt = this.getNodeParameter('prompt', i) as string;
-        const systemPrompt = this.getNodeParameter('systemPrompt', i, '') as string;
-        const maxTokens = this.getNodeParameter('maxTokens', i, 4096) as number;
-        const temperature = this.getNodeParameter('temperature', i, 1.0) as number;
-        const streaming = this.getNodeParameter('streaming', i, false) as boolean;
-        const extendedThinking = this.getNodeParameter('extendedThinking', i, false) as boolean;
-        const thinkingBudget = extendedThinking
-          ? (this.getNodeParameter('thinkingBudget', i, 10000) as number)
-          : undefined;
+    const modelId = this.getNodeParameter('model', itemIndex) as string;
+    const maxTokens = this.getNodeParameter('maxTokens', itemIndex, 4096) as number;
+    const temperature = this.getNodeParameter('temperature', itemIndex, 1.0) as number;
+    const extendedThinking = this.getNodeParameter('extendedThinking', itemIndex, false) as boolean;
+    const thinkingBudget = extendedThinking
+      ? (this.getNodeParameter('thinkingBudget', itemIndex, 10000) as number)
+      : undefined;
 
-        if (!prompt.trim()) {
-          throw new NodeOperationError(this.getNode(), 'Prompt cannot be empty', {
-            itemIndex: i,
-          });
-        }
+    const model = new ClaudeProChatModel({
+      token,
+      modelId,
+      maxTokens,
+      temperature,
+      extendedThinking,
+      thinkingBudget,
+      n8nContext: {
+        addInputData: this.addInputData.bind(this),
+        addOutputData: this.addOutputData.bind(this),
+        connectionType: NodeConnectionTypes.AiLanguageModel as NodeConnectionType,
+      },
+    });
 
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const body: Record<string, any> = {
-          model,
-          max_tokens: maxTokens,
-          messages: [{ role: 'user', content: prompt }],
-          stream: streaming,
-        };
-
-        if (systemPrompt.trim()) {
-          body.system = systemPrompt;
-        }
-
-        if (extendedThinking && thinkingBudget) {
-          body.thinking = {
-            type: 'enabled',
-            budget_tokens: thinkingBudget,
-          };
-          // Temperature must be 1 when extended thinking is enabled
-          body.temperature = 1;
-        } else {
-          body.temperature = temperature;
-        }
-
-        let result: INodeExecutionData;
-
-        if (streaming) {
-          try {
-            const response = await this.helpers.httpRequest({
-              method: 'POST',
-              url: 'https://api.anthropic.com/v1/messages',
-              body,
-              returnFullResponse: true,
-              encoding: 'text',
-              json: false,
-              headers: authHeaders,
-            });
-
-            const rawBody =
-              typeof response.body === 'string' ? response.body : JSON.stringify(response.body);
-            const parsed = parseSSE(rawBody, model);
-            result = { json: { ...parsed } };
-          } catch {
-            // Fallback: use native https for SSE if n8n helpers don't handle it
-            result = await executeStreamingFallback(this, body);
-          }
-        } else {
-          const response = (await this.helpers.httpRequest({
-            method: 'POST',
-            url: 'https://api.anthropic.com/v1/messages',
-            body,
-            headers: authHeaders,
-          })) as AnthropicResponse;
-
-          const textBlocks = response.content.filter((b) => b.type === 'text');
-          const thinkingBlocks = response.content.filter((b) => b.type === 'thinking');
-
-          result = {
-            json: {
-              text: textBlocks.map((b) => b.text || '').join(''),
-              thinking: thinkingBlocks.map((b) => b.text || '').join(''),
-              model: response.model,
-              stopReason: response.stop_reason,
-              usage: {
-                inputTokens: response.usage.input_tokens,
-                outputTokens: response.usage.output_tokens,
-              },
-            },
-          };
-        }
-
-        returnData.push(result);
-      } catch (error) {
-        if (this.continueOnFail()) {
-          returnData.push({
-            json: { error: formatApiError(error) },
-            pairedItem: { item: i },
-          });
-          continue;
-        }
-
-        if (error instanceof NodeOperationError) {
-          throw error;
-        }
-        throw new NodeOperationError(this.getNode(), formatApiError(error), { itemIndex: i });
-      }
-    }
-
-    return [returnData];
+    return { response: model };
   }
 }
