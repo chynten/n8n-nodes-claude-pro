@@ -1,9 +1,11 @@
 import {
   ILoadOptionsFunctions,
+  INodeExecutionData,
   INodePropertyOptions,
   INodeType,
   INodeTypeDescription,
   ISupplyDataFunctions,
+  NodeConnectionType,
   NodeConnectionTypes,
   SupplyData,
 } from 'n8n-workflow';
@@ -209,6 +211,12 @@ interface ClaudeProCallOptions extends BaseChatModelCallOptions {
   tools?: AnthropicTool[];
 }
 
+interface N8nExecutionContext {
+  addInputData: ISupplyDataFunctions['addInputData'];
+  addOutputData: ISupplyDataFunctions['addOutputData'];
+  connectionType: NodeConnectionType;
+}
+
 interface ClaudeProModelInput {
   token: string;
   modelId: string;
@@ -221,6 +229,7 @@ interface ClaudeProModelInput {
   timeout: number;
   maxRetries: number;
   tools?: AnthropicTool[];
+  n8nContext?: N8nExecutionContext;
 }
 
 class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
@@ -235,6 +244,7 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
   private timeout: number;
   private maxRetries: number;
   private boundTools?: AnthropicTool[];
+  private n8nContext?: N8nExecutionContext;
 
   lc_serializable = false;
 
@@ -251,6 +261,7 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
     this.timeout = fields.timeout;
     this.maxRetries = fields.maxRetries;
     this.boundTools = fields.tools;
+    this.n8nContext = fields.n8nContext;
   }
 
   _llmType(): string {
@@ -274,6 +285,7 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
       timeout: this.timeout,
       maxRetries: this.maxRetries,
       tools: anthropicTools,
+      n8nContext: this.n8nContext,
     }) as unknown as Runnable<BaseLanguageModelInput, AIMessageChunk, ClaudeProCallOptions>;
   }
 
@@ -282,7 +294,38 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
     options: this['ParsedCallOptions'],
     _runManager?: CallbackManagerForLLMRun,
   ): Promise<ChatResult> {
-    return this._withRetry(() => this._callApi(messages, options));
+    let runIndex: number | undefined;
+    if (this.n8nContext) {
+      const inputPayload: INodeExecutionData[] = messages.map((msg) => ({
+        json: { role: msg._getType(), content: msg.content },
+      }));
+      const result = this.n8nContext.addInputData(this.n8nContext.connectionType, [inputPayload]);
+      runIndex = result.index;
+    }
+
+    try {
+      const chatResult = await this._withRetry(() => this._callApi(messages, options));
+
+      if (this.n8nContext && runIndex !== undefined) {
+        const outputPayload: INodeExecutionData[] = chatResult.generations.map((g) => ({
+          json: {
+            text: g.text,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            toolCalls: (g.message as any).tool_calls || [],
+            tokenUsage: g.message.additional_kwargs?.usage || {},
+          },
+        }));
+        this.n8nContext.addOutputData(this.n8nContext.connectionType, runIndex, [outputPayload]);
+      }
+
+      return chatResult;
+    } catch (error) {
+      if (this.n8nContext && runIndex !== undefined) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        this.n8nContext.addOutputData(this.n8nContext.connectionType, runIndex, error as any);
+      }
+      throw error;
+    }
   }
 
   private _isRetryableError(error: unknown): boolean {
@@ -428,104 +471,128 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun,
   ): AsyncGenerator<ChatGenerationChunk> {
-    const body = this._buildRequestBody(messages, options);
-    body.stream = true;
-
-    const headers = buildAuthHeaders(this.token);
-    const https = require('https');
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const res = await new Promise<any>((resolve, reject) => {
-      const postData = JSON.stringify(body);
-      const reqOptions = {
-        hostname: 'api.anthropic.com',
-        path: '/v1/messages',
-        method: 'POST',
-        headers: { ...headers, 'content-length': Buffer.byteLength(postData) },
-      };
-
-      const req = https.request(reqOptions, resolve);
-      req.setTimeout(this.timeout, () => {
-        req.destroy();
-        reject(new Error(`Anthropic API request timed out after ${this.timeout}ms`));
-      });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      req.on('error', (error: any) => reject(error));
-      req.write(postData);
-      req.end();
-    });
-
-    if (res.statusCode && res.statusCode >= 400) {
-      let rawData = '';
-      for await (const chunk of res) {
-        rawData += chunk.toString();
-      }
-      throw new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}`);
+    let runIndex: number | undefined;
+    if (this.n8nContext) {
+      const inputPayload: INodeExecutionData[] = messages.map((msg) => ({
+        json: { role: msg._getType(), content: msg.content },
+      }));
+      const result = this.n8nContext.addInputData(this.n8nContext.connectionType, [inputPayload]);
+      runIndex = result.index;
     }
 
-    const toolBlocks = new Map<number, { id: string; name: string; partialJson: string }>();
+    try {
+      const body = this._buildRequestBody(messages, options);
+      body.stream = true;
 
-    for await (const { event, data } of parseSSEEvents(res)) {
-      if (event === 'message_stop') break;
+      const headers = buildAuthHeaders(this.token);
+      const https = require('https');
 
-      if (event === 'error') {
-        throw new Error(`Anthropic stream error: ${JSON.stringify(data)}`);
-      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const res = await new Promise<any>((resolve, reject) => {
+        const postData = JSON.stringify(body);
+        const reqOptions = {
+          hostname: 'api.anthropic.com',
+          path: '/v1/messages',
+          method: 'POST',
+          headers: { ...headers, 'content-length': Buffer.byteLength(postData) },
+        };
 
-      if (event === 'content_block_start') {
-        if (data.content_block?.type === 'tool_use') {
-          toolBlocks.set(data.index, {
-            id: data.content_block.id,
-            name: data.content_block.name,
-            partialJson: '',
-          });
+        const req = https.request(reqOptions, resolve);
+        req.setTimeout(this.timeout, () => {
+          req.destroy();
+          reject(new Error(`Anthropic API request timed out after ${this.timeout}ms`));
+        });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        req.on('error', (error: any) => reject(error));
+        req.write(postData);
+        req.end();
+      });
+
+      if (res.statusCode && res.statusCode >= 400) {
+        let rawData = '';
+        for await (const chunk of res) {
+          rawData += chunk.toString();
         }
-        continue;
+        throw new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}`);
       }
 
-      if (event === 'content_block_delta') {
-        if (data.delta?.type === 'text_delta') {
-          const text = data.delta.text || '';
-          const chunk = new ChatGenerationChunk({
-            text,
-            message: new AIMessageChunk({ content: text }),
-          });
-          yield chunk;
-          await runManager?.handleLLMNewToken(text);
-        } else if (data.delta?.type === 'input_json_delta') {
+      const toolBlocks = new Map<number, { id: string; name: string; partialJson: string }>();
+      let fullText = '';
+
+      for await (const { event, data } of parseSSEEvents(res)) {
+        if (event === 'message_stop') break;
+
+        if (event === 'error') {
+          throw new Error(`Anthropic stream error: ${JSON.stringify(data)}`);
+        }
+
+        if (event === 'content_block_start') {
+          if (data.content_block?.type === 'tool_use') {
+            toolBlocks.set(data.index, {
+              id: data.content_block.id,
+              name: data.content_block.name,
+              partialJson: '',
+            });
+          }
+          continue;
+        }
+
+        if (event === 'content_block_delta') {
+          if (data.delta?.type === 'text_delta') {
+            const text = data.delta.text || '';
+            fullText += text;
+            const chunk = new ChatGenerationChunk({
+              text,
+              message: new AIMessageChunk({ content: text }),
+            });
+            yield chunk;
+            await runManager?.handleLLMNewToken(text);
+          } else if (data.delta?.type === 'input_json_delta') {
+            const block = toolBlocks.get(data.index);
+            if (block) {
+              block.partialJson += data.delta.partial_json || '';
+            }
+          }
+          continue;
+        }
+
+        if (event === 'content_block_stop') {
           const block = toolBlocks.get(data.index);
           if (block) {
-            block.partialJson += data.delta.partial_json || '';
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            let args: Record<string, any> = {};
+            try {
+              args = JSON.parse(block.partialJson);
+            } catch {
+              // use empty args if JSON is malformed
+            }
+            const toolCall: ToolCall = {
+              name: block.name,
+              args,
+              id: block.id,
+              type: 'tool_call' as const,
+            };
+            const chunk = new ChatGenerationChunk({
+              text: '',
+              message: new AIMessageChunk({ content: '', tool_calls: [toolCall] }),
+            });
+            yield chunk;
+            toolBlocks.delete(data.index);
           }
+          continue;
         }
-        continue;
       }
 
-      if (event === 'content_block_stop') {
-        const block = toolBlocks.get(data.index);
-        if (block) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          let args: Record<string, any> = {};
-          try {
-            args = JSON.parse(block.partialJson);
-          } catch {
-            // use empty args if JSON is malformed
-          }
-          const toolCall: ToolCall = {
-            name: block.name,
-            args,
-            id: block.id,
-            type: 'tool_call' as const,
-          };
-          const chunk = new ChatGenerationChunk({
-            text: '',
-            message: new AIMessageChunk({ content: '', tool_calls: [toolCall] }),
-          });
-          yield chunk;
-          toolBlocks.delete(data.index);
-        }
-        continue;
+      if (this.n8nContext && runIndex !== undefined) {
+        const outputPayload: INodeExecutionData[] = [{ json: { text: fullText } }];
+        this.n8nContext.addOutputData(this.n8nContext.connectionType, runIndex, [outputPayload]);
       }
+    } catch (error) {
+      if (this.n8nContext && runIndex !== undefined) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        this.n8nContext.addOutputData(this.n8nContext.connectionType, runIndex, error as any);
+      }
+      throw error;
     }
   }
 }
@@ -704,6 +771,11 @@ export class ClaudePro implements INodeType {
       thinkingBudget,
       timeout,
       maxRetries,
+      n8nContext: {
+        addInputData: this.addInputData.bind(this),
+        addOutputData: this.addOutputData.bind(this),
+        connectionType: NodeConnectionTypes.AiLanguageModel as NodeConnectionType,
+      },
     });
 
     return { response: model };
