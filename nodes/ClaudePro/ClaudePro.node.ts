@@ -595,6 +595,7 @@ export class ClaudePro implements INodeType {
     },
     inputs: [],
     outputs: [NodeConnectionTypes.AiLanguageModel],
+    outputNames: ['Model'],
     credentials: [
       {
         name: 'claudeProApi',
