@@ -1,11 +1,9 @@
 import {
   ILoadOptionsFunctions,
-  INodeExecutionData,
   INodePropertyOptions,
   INodeType,
   INodeTypeDescription,
   ISupplyDataFunctions,
-  NodeConnectionType,
   NodeConnectionTypes,
   SupplyData,
 } from 'n8n-workflow';
@@ -211,12 +209,6 @@ interface ClaudeProCallOptions extends BaseChatModelCallOptions {
   tools?: AnthropicTool[];
 }
 
-interface N8nExecutionContext {
-  addInputData: ISupplyDataFunctions['addInputData'];
-  addOutputData: ISupplyDataFunctions['addOutputData'];
-  connectionType: NodeConnectionType;
-}
-
 interface ClaudeProModelInput {
   token: string;
   modelId: string;
@@ -229,7 +221,6 @@ interface ClaudeProModelInput {
   timeout: number;
   maxRetries: number;
   tools?: AnthropicTool[];
-  n8nContext?: N8nExecutionContext;
 }
 
 class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
@@ -244,7 +235,6 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
   private timeout: number;
   private maxRetries: number;
   private boundTools?: AnthropicTool[];
-  private n8nContext?: N8nExecutionContext;
 
   lc_serializable = false;
 
@@ -261,7 +251,6 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
     this.timeout = fields.timeout;
     this.maxRetries = fields.maxRetries;
     this.boundTools = fields.tools;
-    this.n8nContext = fields.n8nContext;
   }
 
   _llmType(): string {
@@ -285,7 +274,6 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
       timeout: this.timeout,
       maxRetries: this.maxRetries,
       tools: anthropicTools,
-      n8nContext: this.n8nContext,
     }) as unknown as Runnable<BaseLanguageModelInput, AIMessageChunk, ClaudeProCallOptions>;
   }
 
@@ -294,40 +282,7 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
     options: this['ParsedCallOptions'],
     _runManager?: CallbackManagerForLLMRun,
   ): Promise<ChatResult> {
-    // Log input to n8n execution tracker
-    let runIndex: number | undefined;
-    if (this.n8nContext) {
-      const inputPayload: INodeExecutionData[] = messages.map((msg) => ({
-        json: { role: msg._getType(), content: msg.content },
-      }));
-      const result = this.n8nContext.addInputData(this.n8nContext.connectionType, [inputPayload]);
-      runIndex = result.index;
-    }
-
-    try {
-      const chatResult = await this._withRetry(() => this._callApi(messages, options));
-
-      // Log output to n8n execution tracker
-      if (this.n8nContext && runIndex !== undefined) {
-        const outputPayload: INodeExecutionData[] = chatResult.generations.map((g) => ({
-          json: {
-            text: g.text,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            toolCalls: (g.message as any).tool_calls || [],
-            tokenUsage: g.message.additional_kwargs?.usage || {},
-          },
-        }));
-        this.n8nContext.addOutputData(this.n8nContext.connectionType, runIndex, [outputPayload]);
-      }
-
-      return chatResult;
-    } catch (error) {
-      if (this.n8nContext && runIndex !== undefined) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        this.n8nContext.addOutputData(this.n8nContext.connectionType, runIndex, error as any);
-      }
-      throw error;
-    }
+    return this._withRetry(() => this._callApi(messages, options));
   }
 
   private _isRetryableError(error: unknown): boolean {
@@ -749,11 +704,6 @@ export class ClaudePro implements INodeType {
       thinkingBudget,
       timeout,
       maxRetries,
-      n8nContext: {
-        addInputData: this.addInputData.bind(this),
-        addOutputData: this.addOutputData.bind(this),
-        connectionType: NodeConnectionTypes.AiLanguageModel as NodeConnectionType,
-      },
     });
 
     return { response: model };
