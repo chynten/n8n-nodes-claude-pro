@@ -83,6 +83,9 @@ const MODEL_MAX_TOKENS: Record<string, number> = {
 };
 
 const DEFAULT_MAX_TOKENS = 16384;
+const CLAUDE_CLI_USER_AGENT = 'claude-cli/2.1.77 (external, cli)';
+const OAUTH_BETAS = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24';
+const OAUTH_BILLING_HEADER = 'x-anthropic-billing-header: cc_version=2.1.77; cc_entrypoint=cli;';
 
 function getMaxTokensForModel(modelId: string): number {
   if (MODEL_MAX_TOKENS[modelId]) {
@@ -106,25 +109,29 @@ function isOAuthToken(token: string): boolean {
 }
 
 function buildAuthHeaders(token: string): Record<string, string> {
-  const baseBetas = [
-    'interleaved-thinking-2025-05-14',
-    'fine-grained-tool-streaming-2025-05-14',
-  ];
-
   const headers: Record<string, string> = {
+    'accept': 'application/json',
     'anthropic-version': '2023-06-01',
     'content-type': 'application/json',
   };
 
   if (isOAuthToken(token)) {
-    headers['Authorization'] = `Bearer ${token}`;
-    headers['anthropic-beta'] = [...baseBetas, 'oauth-2025-04-20', 'claude-code-20250219'].join(',');
+    headers['authorization'] = `Bearer ${token}`;
+    headers['anthropic-beta'] = OAUTH_BETAS;
     headers['anthropic-dangerous-direct-browser-access'] = 'true';
+    headers['user-agent'] = CLAUDE_CLI_USER_AGENT;
+    headers['x-app'] = 'cli';
   } else {
     headers['x-api-key'] = token;
-    headers['anthropic-beta'] = baseBetas.join(',');
+    headers['anthropic-beta'] = 'interleaved-thinking-2025-05-14';
   }
   return headers;
+}
+
+function getMessagesUrl(token: string): string {
+  return isOAuthToken(token)
+    ? 'https://api.anthropic.com/v1/messages?beta=true'
+    : 'https://api.anthropic.com/v1/messages';
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -413,7 +420,16 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
       messages: apiMessages,
     };
 
-    if (system) {
+    // OAuth tokens require a billing header in the system prompt for Sonnet/Opus access
+    if (isOAuthToken(this.token)) {
+      const systemParts: Array<{ type: string; text: string }> = [
+        { type: 'text', text: OAUTH_BILLING_HEADER },
+      ];
+      if (system) {
+        systemParts.push({ type: 'text', text: system });
+      }
+      body.system = systemParts;
+    } else if (system) {
       body.system = system;
     }
 
@@ -452,55 +468,46 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
   ): Promise<ChatResult> {
     const body = this._buildRequestBody(messages, options);
     const headers = buildAuthHeaders(this.token);
-    const https = require('https');
+    const postData = JSON.stringify(body);
 
-    const response = await new Promise<AnthropicResponse>((resolve, reject) => {
-      const postData = JSON.stringify(body);
-      const reqOptions = {
-        hostname: 'api.anthropic.com',
-        path: '/v1/messages',
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+    let response: AnthropicResponse;
+    try {
+      const res = await fetch(getMessagesUrl(this.token), {
         method: 'POST',
-        headers: { ...headers, 'content-length': Buffer.byteLength(postData) },
-      };
+        headers,
+        body: postData,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const req = https.request(reqOptions, (res: any) => {
-        let rawData = '';
-        res.on('data', (chunk: Buffer) => { rawData += chunk.toString(); });
-        res.on('end', () => {
-          if (res.statusCode && res.statusCode >= 400) {
-            // Include request body (with token masked) for debugging
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const debugHeaders: Record<string, any> = { ...headers };
-            if (debugHeaders['x-api-key']) debugHeaders['x-api-key'] = '***masked***';
-            if (debugHeaders['Authorization']) debugHeaders['Authorization'] = '***masked***';
-            const debugInfo = `\n[Request Headers]: ${JSON.stringify(debugHeaders)}\n[Request Body]: ${JSON.stringify(body, null, 2)}`;
-            try {
-              const errorBody = JSON.parse(rawData);
-              const errorType = errorBody?.error?.type || 'unknown';
-              const errorMsg = errorBody?.error?.message || rawData;
-              reject(new Error(`Anthropic API error (HTTP ${res.statusCode}) [${errorType}]: ${errorMsg}${debugInfo}`));
-            } catch {
-              reject(new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}${debugInfo}`));
-            }
-            return;
-          }
-          try {
-            resolve(JSON.parse(rawData) as AnthropicResponse);
-          } catch {
-            reject(new Error(`Failed to parse Anthropic response: ${rawData}`));
-          }
-        });
-      });
-      req.setTimeout(this.timeout, () => {
-        req.destroy();
-        reject(new Error(`Anthropic API request timed out after ${this.timeout}ms`));
-      });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      req.on('error', (error: any) => reject(error));
-      req.write(postData);
-      req.end();
-    });
+      if (!res.ok) {
+        const rawData = await res.text();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const debugHeaders: Record<string, any> = { ...headers };
+        if (debugHeaders['x-api-key']) debugHeaders['x-api-key'] = '***masked***';
+        if (debugHeaders['authorization']) debugHeaders['authorization'] = '***masked***';
+        const debugInfo = `\n[Request Headers]: ${JSON.stringify(debugHeaders)}\n[Request Body]: ${JSON.stringify(body, null, 2)}`;
+        try {
+          const errorBody = JSON.parse(rawData);
+          const errorType = errorBody?.error?.type || 'unknown';
+          const errorMsg = errorBody?.error?.message || rawData;
+          throw new Error(`Anthropic API error (HTTP ${res.status}) [${errorType}]: ${errorMsg}\n[Full API Response]: ${rawData}${debugInfo}`);
+        } catch (parseError) {
+          if (parseError instanceof Error && parseError.message.startsWith('Anthropic API error')) throw parseError;
+          throw new Error(`Anthropic API error (HTTP ${res.status}): ${rawData}${debugInfo}`);
+        }
+      }
+      response = await res.json() as AnthropicResponse;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Anthropic API request timed out after ${this.timeout}ms`);
+      }
+      throw error;
+    }
 
     const textBlocks = response.content.filter((b) => b.type === 'text');
     const toolUseBlocks = response.content.filter((b) => b.type === 'tool_use');
@@ -553,54 +560,64 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
       body.stream = true;
 
       const headers = buildAuthHeaders(this.token);
-      const https = require('https');
+      const postData = JSON.stringify(body);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const res = await new Promise<any>((resolve, reject) => {
-        const postData = JSON.stringify(body);
-        const reqOptions = {
-          hostname: 'api.anthropic.com',
-          path: '/v1/messages',
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+      let res: Response;
+      try {
+        res = await fetch(getMessagesUrl(this.token), {
           method: 'POST',
-          headers: { ...headers, 'content-length': Buffer.byteLength(postData) },
-        };
-
-        const req = https.request(reqOptions, resolve);
-        req.setTimeout(this.timeout, () => {
-          req.destroy();
-          reject(new Error(`Anthropic API request timed out after ${this.timeout}ms`));
+          headers,
+          body: postData,
+          signal: controller.signal,
         });
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        req.on('error', (error: any) => reject(error));
-        req.write(postData);
-        req.end();
-      });
-
-      if (res.statusCode && res.statusCode >= 400) {
-        let rawData = '';
-        for await (const chunk of res) {
-          rawData += chunk.toString();
+        clearTimeout(timeoutId);
+      } catch (fetchError) {
+        clearTimeout(timeoutId);
+        if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+          throw new Error(`Anthropic API request timed out after ${this.timeout}ms`);
         }
-        // Include request body (with token masked) for debugging
+        throw fetchError;
+      }
+
+      if (!res.ok) {
+        const rawData = await res.text();
         const debugHeaders = { ...headers };
         if (debugHeaders['x-api-key']) debugHeaders['x-api-key'] = '***masked***';
-        if (debugHeaders['Authorization']) debugHeaders['Authorization'] = '***masked***';
+        if (debugHeaders['authorization']) debugHeaders['authorization'] = '***masked***';
         const debugInfo = `\n[Request Headers]: ${JSON.stringify(debugHeaders)}\n[Request Body]: ${JSON.stringify(body, null, 2)}`;
         try {
           const errorBody = JSON.parse(rawData);
           const errorType = errorBody?.error?.type || 'unknown';
           const errorMsg = errorBody?.error?.message || rawData;
-          throw new Error(`Anthropic API error (HTTP ${res.statusCode}) [${errorType}]: ${errorMsg}${debugInfo}`);
+          throw new Error(`Anthropic API error (HTTP ${res.status}) [${errorType}]: ${errorMsg}\n[Full API Response]: ${rawData}${debugInfo}`);
         } catch (parseError) {
           if (parseError instanceof Error && parseError.message.startsWith('Anthropic API error')) throw parseError;
-          throw new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}${debugInfo}`);
+          throw new Error(`Anthropic API error (HTTP ${res.status}): ${rawData}${debugInfo}`);
         }
       }
+
+      // Adapt fetch ReadableStream for SSE parsing
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const streamIterable: any = {
+        [Symbol.asyncIterator]() {
+          const reader = res.body!.getReader();
+          return {
+            async next() {
+              const { done, value } = await reader.read();
+              if (done) return { done: true, value: undefined };
+              return { done: false, value: Buffer.from(value) };
+            },
+          };
+        },
+      };
 
       const toolBlocks = new Map<number, { id: string; name: string; partialJson: string }>();
       let fullText = '';
 
-      for await (const { event, data } of parseSSEEvents(res)) {
+      for await (const { event, data } of parseSSEEvents(streamIterable)) {
         if (event === 'message_stop') break;
 
         if (event === 'error') {
