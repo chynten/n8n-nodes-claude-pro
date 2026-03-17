@@ -459,13 +459,19 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
         res.on('data', (chunk: Buffer) => { rawData += chunk.toString(); });
         res.on('end', () => {
           if (res.statusCode && res.statusCode >= 400) {
+            // Include request body (with token masked) for debugging
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const debugHeaders: Record<string, any> = { ...headers };
+            if (debugHeaders['x-api-key']) debugHeaders['x-api-key'] = '***masked***';
+            if (debugHeaders['Authorization']) debugHeaders['Authorization'] = '***masked***';
+            const debugInfo = `\n[Request Headers]: ${JSON.stringify(debugHeaders)}\n[Request Body]: ${JSON.stringify(body, null, 2)}`;
             try {
               const errorBody = JSON.parse(rawData);
               const errorType = errorBody?.error?.type || 'unknown';
               const errorMsg = errorBody?.error?.message || rawData;
-              reject(new Error(`Anthropic API error (HTTP ${res.statusCode}) [${errorType}]: ${errorMsg}`));
+              reject(new Error(`Anthropic API error (HTTP ${res.statusCode}) [${errorType}]: ${errorMsg}${debugInfo}`));
             } catch {
-              reject(new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}`));
+              reject(new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}${debugInfo}`));
             }
             return;
           }
@@ -565,14 +571,19 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
         for await (const chunk of res) {
           rawData += chunk.toString();
         }
+        // Include request body (with token masked) for debugging
+        const debugHeaders = { ...headers };
+        if (debugHeaders['x-api-key']) debugHeaders['x-api-key'] = '***masked***';
+        if (debugHeaders['Authorization']) debugHeaders['Authorization'] = '***masked***';
+        const debugInfo = `\n[Request Headers]: ${JSON.stringify(debugHeaders)}\n[Request Body]: ${JSON.stringify(body, null, 2)}`;
         try {
           const errorBody = JSON.parse(rawData);
           const errorType = errorBody?.error?.type || 'unknown';
           const errorMsg = errorBody?.error?.message || rawData;
-          throw new Error(`Anthropic API error (HTTP ${res.statusCode}) [${errorType}]: ${errorMsg}`);
+          throw new Error(`Anthropic API error (HTTP ${res.statusCode}) [${errorType}]: ${errorMsg}${debugInfo}`);
         } catch (parseError) {
           if (parseError instanceof Error && parseError.message.startsWith('Anthropic API error')) throw parseError;
-          throw new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}`);
+          throw new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}${debugInfo}`);
         }
       }
 
