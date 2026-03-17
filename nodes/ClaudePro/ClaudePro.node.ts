@@ -230,10 +230,14 @@ async function* parseSSEEvents(stream: any): AsyncGenerator<{ event: string; dat
 function openAiToolToAnthropic(tools: BindToolsInput[]): AnthropicTool[] {
   return tools.map((tool) => {
     const openAiTool = convertToOpenAITool(tool);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const params: Record<string, any> = { ...(openAiTool.function.parameters || { type: 'object', properties: {} }) };
+    // Anthropic API rejects $schema in tool input_schema
+    delete params.$schema;
     return {
       name: openAiTool.function.name,
       description: openAiTool.function.description || '',
-      input_schema: openAiTool.function.parameters || { type: 'object', properties: {} },
+      input_schema: params,
     };
   });
 }
@@ -415,7 +419,13 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
 
     const tools = (options.tools && options.tools.length > 0) ? options.tools : this.boundTools;
     if (tools && tools.length > 0) {
-      body.tools = tools;
+      // Strip $schema from all tool input_schema — Anthropic API rejects it
+      body.tools = tools.map((t) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const schema: Record<string, any> = { ...t.input_schema };
+        delete schema.$schema;
+        return { ...t, input_schema: schema };
+      });
     }
 
     if (this.extendedThinking && this.thinkingBudget) {
