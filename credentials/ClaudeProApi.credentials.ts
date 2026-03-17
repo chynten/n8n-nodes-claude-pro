@@ -28,10 +28,13 @@ export class ClaudeProApi implements ICredentialType {
     properties: {
       headers: {
         'Authorization': '=Bearer {{$credentials.setupToken}}',
-        'anthropic-beta': 'interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,oauth-2025-04-20,claude-code-20250219',
+        'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24',
         'anthropic-dangerous-direct-browser-access': 'true',
         'anthropic-version': '2023-06-01',
         'content-type': 'application/json',
+        'accept': 'application/json',
+        'user-agent': 'claude-cli/2.1.77 (external, cli)',
+        'x-app': 'cli',
       },
     },
   };
