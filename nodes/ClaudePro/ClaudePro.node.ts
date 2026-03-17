@@ -106,16 +106,23 @@ function isOAuthToken(token: string): boolean {
 }
 
 function buildAuthHeaders(token: string): Record<string, string> {
+  const baseBetas = [
+    'interleaved-thinking-2025-05-14',
+    'fine-grained-tool-streaming-2025-05-14',
+  ];
+
   const headers: Record<string, string> = {
     'anthropic-version': '2023-06-01',
     'content-type': 'application/json',
   };
+
   if (isOAuthToken(token)) {
     headers['Authorization'] = `Bearer ${token}`;
-    headers['anthropic-beta'] = 'oauth-2025-04-20,claude-code-20250219';
+    headers['anthropic-beta'] = [...baseBetas, 'oauth-2025-04-20', 'claude-code-20250219'].join(',');
     headers['anthropic-dangerous-direct-browser-access'] = 'true';
   } else {
     headers['x-api-key'] = token;
+    headers['anthropic-beta'] = baseBetas.join(',');
   }
   return headers;
 }
@@ -175,6 +182,10 @@ function convertMessages(messages: BaseMessage[]): Array<{ role: string; content
 
     const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
     return { role, content };
+  }).filter((msg) => {
+    // Filter out messages with empty content (strings only; arrays like tool_result are kept)
+    if (typeof msg.content === 'string' && msg.content.trim() === '') return false;
+    return true;
   });
 }
 
@@ -379,6 +390,18 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
     const { system, filtered } = extractSystemMessage(messages);
     const apiMessages = convertMessages(filtered);
 
+    // Claude Opus 4.6 does not support prefilling assistant messages
+    if (this.modelId.includes('opus-4-6') && apiMessages.length > 0) {
+      if (apiMessages[apiMessages.length - 1].role === 'assistant') {
+        apiMessages.pop();
+      }
+    }
+
+    // Ensure messages array is non-empty
+    if (apiMessages.length === 0) {
+      apiMessages.push({ role: 'user', content: 'Hello' });
+    }
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const body: Record<string, any> = {
       model: this.modelId,
@@ -396,8 +419,8 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
     }
 
     if (this.extendedThinking && this.thinkingBudget) {
-      // budget_tokens must be strictly less than max_tokens per Anthropic API
-      const effectiveBudget = Math.min(this.thinkingBudget, this.maxTokens - 1);
+      // budget_tokens must be strictly less than max_tokens and at least 1024 per Anthropic API
+      const effectiveBudget = Math.max(1024, Math.min(this.thinkingBudget, this.maxTokens - 1));
       body.thinking = { type: 'enabled', budget_tokens: effectiveBudget };
       body.temperature = 1;
     } else {
@@ -436,7 +459,14 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
         res.on('data', (chunk: Buffer) => { rawData += chunk.toString(); });
         res.on('end', () => {
           if (res.statusCode && res.statusCode >= 400) {
-            reject(new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}`));
+            try {
+              const errorBody = JSON.parse(rawData);
+              const errorType = errorBody?.error?.type || 'unknown';
+              const errorMsg = errorBody?.error?.message || rawData;
+              reject(new Error(`Anthropic API error (HTTP ${res.statusCode}) [${errorType}]: ${errorMsg}`));
+            } catch {
+              reject(new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}`));
+            }
             return;
           }
           try {
@@ -535,7 +565,15 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
         for await (const chunk of res) {
           rawData += chunk.toString();
         }
-        throw new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}`);
+        try {
+          const errorBody = JSON.parse(rawData);
+          const errorType = errorBody?.error?.type || 'unknown';
+          const errorMsg = errorBody?.error?.message || rawData;
+          throw new Error(`Anthropic API error (HTTP ${res.statusCode}) [${errorType}]: ${errorMsg}`);
+        } catch (parseError) {
+          if (parseError instanceof Error && parseError.message.startsWith('Anthropic API error')) throw parseError;
+          throw new Error(`Anthropic API error (HTTP ${res.statusCode}): ${rawData}`);
+        }
       }
 
       const toolBlocks = new Map<number, { id: string; name: string; partialJson: string }>();

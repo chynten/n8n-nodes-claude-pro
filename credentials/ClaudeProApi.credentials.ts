@@ -28,7 +28,7 @@ export class ClaudeProApi implements ICredentialType {
     properties: {
       headers: {
         'Authorization': '=Bearer {{$credentials.setupToken}}',
-        'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+        'anthropic-beta': 'interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,oauth-2025-04-20,claude-code-20250219',
         'anthropic-dangerous-direct-browser-access': 'true',
         'anthropic-version': '2023-06-01',
         'content-type': 'application/json',
