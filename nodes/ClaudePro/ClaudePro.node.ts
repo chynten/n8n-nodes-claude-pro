@@ -48,9 +48,24 @@ interface AnthropicResponse {
 }
 
 const MODEL_MAX_TOKENS: Record<string, number> = {
-  // Claude 4 family
-  'claude-opus-4-0-20250514': 16384,
-  'claude-sonnet-4-0-20250514': 16384,
+  // Claude 4.6 family
+  'claude-opus-4-6': 128000,
+  'claude-sonnet-4-6': 64000,
+  // Claude 4.5 family
+  'claude-opus-4-5-20251101': 64000,
+  'claude-opus-4-5': 64000,
+  'claude-sonnet-4-5-20250929': 64000,
+  'claude-sonnet-4-5': 64000,
+  'claude-haiku-4-5-20251001': 64000,
+  'claude-haiku-4-5': 64000,
+  // Claude 4.1 family
+  'claude-opus-4-1-20250805': 32000,
+  'claude-opus-4-1': 32000,
+  // Claude 4.0 family
+  'claude-opus-4-20250514': 32000,
+  'claude-opus-4-0': 32000,
+  'claude-sonnet-4-20250514': 64000,
+  'claude-sonnet-4-0': 64000,
   // Claude 3.7 family
   'claude-3-7-sonnet-20250219': 16384,
   'claude-3-7-sonnet-latest': 16384,
@@ -67,14 +82,19 @@ const MODEL_MAX_TOKENS: Record<string, number> = {
   'claude-3-haiku-20240307': 4096,
 };
 
-const DEFAULT_MAX_TOKENS = 8192;
+const DEFAULT_MAX_TOKENS = 16384;
 
 function getMaxTokensForModel(modelId: string): number {
   if (MODEL_MAX_TOKENS[modelId]) {
     return MODEL_MAX_TOKENS[modelId];
   }
   // Pattern-based fallback for new model versions
-  if (modelId.startsWith('claude-opus-4') || modelId.startsWith('claude-sonnet-4')) return 16384;
+  if (modelId.includes('opus-4-6') || modelId.includes('opus-4-5')) return 64000;
+  if (modelId.includes('sonnet-4-6') || modelId.includes('sonnet-4-5')) return 64000;
+  if (modelId.includes('haiku-4-5') || modelId.includes('haiku-4')) return 64000;
+  if (modelId.includes('opus-4-1')) return 32000;
+  if (modelId.includes('opus-4')) return 32000;
+  if (modelId.includes('sonnet-4')) return 64000;
   if (modelId.startsWith('claude-3-7')) return 16384;
   if (modelId.startsWith('claude-3-5')) return 8192;
   if (modelId.startsWith('claude-3-')) return 4096;
@@ -376,7 +396,9 @@ class ClaudeProChatModel extends BaseChatModel<ClaudeProCallOptions> {
     }
 
     if (this.extendedThinking && this.thinkingBudget) {
-      body.thinking = { type: 'enabled', budget_tokens: this.thinkingBudget };
+      // budget_tokens must be strictly less than max_tokens per Anthropic API
+      const effectiveBudget = Math.min(this.thinkingBudget, this.maxTokens - 1);
+      body.thinking = { type: 'enabled', budget_tokens: effectiveBudget };
       body.temperature = 1;
     } else {
       body.temperature = this.temperature;
